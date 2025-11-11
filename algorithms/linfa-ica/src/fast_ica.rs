@@ -212,7 +212,7 @@ impl<F: Float + ndarray_linalg::Lapack> FastIcaValidParams<F> {
             Array::random((n, r), StandardNormal).mapv(|z: f64| F::cast(z))
         };
 
-        // Y = X * Omega (D x r), with power iterations and re-orth via thin SVD
+        // Y = X * Omega (D x r), with power iterations
         let mut y = x.dot(&omega);
         for i in 0..n_iter {
             println!("[RandomizedSVD] power iter {}/{}", i + 1, n_iter);
@@ -220,19 +220,47 @@ impl<F: Float + ndarray_linalg::Lapack> FastIcaValidParams<F> {
             let z = x.t().dot(&y);
             y = x.dot(&z);
 
-            // Re-orthonormalize Y -> Q via thin SVD for stability
-            let (u_opt, _s_opt, _vt_opt) = y.with_lapack().svd(true, false)?;
-            y = u_opt
-                .ok_or(FastIcaError::SvdDecomposition)?
-                .without_lapack();
+            // Re-orthonormalize Y -> Q via Cholesky-based method (cheaper than SVD)
+            // Y = Q * R where Q is orthonormal
+            // Y^T Y = R^T R (Cholesky factorization)
+            let ytw = y.t().dot(&y); // r x r (small!)
+            
+            // Use eigendecomposition for numerical stability
+            // Y^T Y = V * diag(s^2) * V^T
+            // Y_orth = Y * V * diag(1/s) * V^T
+            let (eig_vals, eig_vecs) = {
+                #[cfg(feature = "blas")]
+                {
+                    ytw.with_lapack().eigh(UPLO::Upper)?
+                }
+                #[cfg(not(feature = "blas"))]
+                {
+                    ytw.eigh()?
+                }
+            };
+            
+            let eig_vals: Array1<F> = eig_vals.mapv(|x| F::cast(x));
+            let eig_vecs = eig_vecs.without_lapack();
+            
+            // Compute inv_sqrt eigenvalues with clamping
+            let inv_sqrt_eigs: Array1<F> = eig_vals.mapv(|lam| {
+                let threshold = F::cast(1e-10);
+                let clamped = if lam < threshold { threshold } else { lam };
+                let s = num_traits::Float::sqrt(clamped);
+                s.recip()
+            });
+            
+            // Y_orth = Y * V * diag(inv_sqrt) * V^T
+            let tmp = y.dot(&eig_vecs); // D x r
+            let mut tmp2 = tmp.clone();
+            for (mut col, &scale) in tmp2.axis_iter_mut(Axis(1)).zip(inv_sqrt_eigs.iter()) {
+                col.mapv_inplace(|v| v * scale);
+            }
+            y = tmp2.dot(&eig_vecs.t());
         }
 
-        // Final Q from thin SVD of Y (stable)
-        let (u_opt, _s_opt, _vt_opt) = y.with_lapack().svd(true, false)?;
-        let q = u_opt
-            .ok_or(FastIcaError::SvdDecomposition)?
-            .slice_move(s![.., ..r])
-            .without_lapack(); // D x r
+        // Y is now orthonormal (Q), take first r columns
+        let q = y.slice(s![.., ..r]).to_owned(); // D x r
 
         // Stream over X by column blocks to build M = (Q^T X)(Q^T X)^T (r x r)
         let mut m = Array2::<F>::zeros((r, r));
