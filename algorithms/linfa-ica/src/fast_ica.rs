@@ -55,16 +55,21 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
             )));
         }
 
+        println!("[FastICA] Starting fit: {} samples, {} features, {} components", nsamples, nfeatures, ncomponents);
+
         // We center the input by subtracting the mean of its features
         // safe unwrap because we already returned an error on zero samples
+        println!("[FastICA] Computing mean and centering data...");
         let xmean = x.mean_axis(Axis(0)).unwrap();
         let mut xcentered = x - &xmean.view().insert_axis(Axis(0));
 
         // We transpose the centered matrix
+        println!("[FastICA] Transposing centered matrix...");
         xcentered = xcentered.reversed_axes();
 
         // We whiten the matrix to remove any potential correlation between
         // the components
+        println!("[FastICA] Computing SVD for whitening...");
         let xcentered = xcentered.with_lapack();
         let k = match xcentered.svd(true, false)? {
             (Some(u), s, _) => {
@@ -80,6 +85,7 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
             _ => return Err(FastIcaError::SvdDecomposition),
         };
 
+        println!("[FastICA] Whitening data...");
         let mut xwhitened = k.dot(&xcentered).without_lapack();
         let k = k.without_lapack();
 
@@ -88,6 +94,7 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
         xwhitened.mapv_inplace(|x| x * nsamples_sqrt);
 
         // We initialize the de-mixing matrix with a uniform distribution
+        println!("[FastICA] Initializing de-mixing matrix...");
         let w: Array2<f64>;
         if let Some(seed) = self.random_state() {
             let mut rng = Xoshiro256Plus::seed_from_u64(*seed as u64);
@@ -98,11 +105,14 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
         let mut w = w.mapv(F::cast);
 
         // We find the optimized de-mixing matrix
+        println!("[FastICA] Running parallel ICA optimization...");
         w = self.ica_parallel(&xwhitened, &w)?;
 
         // We whiten the de-mixing matrix
+        println!("[FastICA] Computing final components...");
         let components = w.dot(&k);
 
+        println!("[FastICA] Fit complete!");
         Ok(FastIca {
             mean: xmean,
             components,
@@ -112,13 +122,14 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
 
 impl<F: Float> FastIcaValidParams<F> {
     fn ica_parallel(&self, x: &Array2<F>, w_init: &Array2<F>) -> Result<Array2<F>> {
+        println!("[ICA] Starting parallel optimization (max_iter: {})", self.max_iter());
         let mut w = Self::sym_decorrelation(w_init)?;
 
         let p = F::cast(x.ncols() as f64);
         let tol = F::cast(self.tol());
         let max_iter = self.max_iter();
 
-        for _ in 0..max_iter {
+        for iter in 0..max_iter {
             let wtx = w.dot(x);
 
             let (gwtx, g_wtx) = self.gfunc().exec(&wtx)?;
@@ -164,14 +175,17 @@ impl<F: Float> FastIcaValidParams<F> {
             w = wnew;
 
             if lim < tol {
+                println!("[ICA] Converged at iteration {} (lim: {:e} < tol: {:e})", iter + 1, lim, tol);
                 break;
             }
         }
 
+        println!("[ICA] Parallel optimization complete");
         Ok(w)
     }
 
     fn sym_decorrelation(w: &Array2<F>) -> Result<Array2<F>> {
+        println!("[ICA] Starting symmetric decorrelation...");
         let s = w.dot(&w.t()).with_lapack();
 
         #[cfg(feature = "blas")]
@@ -204,6 +218,7 @@ impl<F: Float> FastIcaValidParams<F> {
                 }
             });
 
+        println!("[ICA] Symmetric decorrelation complete");
         Ok(tmp.dot(&eig_vec.t()).dot(w))
     }
 }
