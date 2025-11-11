@@ -100,7 +100,7 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
         println!("[FastICA] Computing SVD for whitening... (matrix size: {}x{})", xcentered.nrows(), xcentered.ncols());
         
         // Use randomized SVD for large matrices (> 10000 elements or if ncomponents << min(dims))
-        let use_randomized = true;//xcentered.len() > 100_000_000 || (ncomponents < nsamples.min(nfeatures) / 4);
+        let use_randomized = false;//xcentered.len() > 100_000_000 || (ncomponents < nsamples.min(nfeatures) / 4);
         
         let k = if use_randomized {
             println!("[FastICA] Using randomized SVD for large-scale whitening");
