@@ -8,10 +8,11 @@ use linfa::{
 #[cfg(not(feature = "blas"))]
 use linfa_linalg::{eigh::*, svd::*};
 use ndarray::{Array, Array1, Array2, ArrayBase, Axis, Data, Ix2};
+use ndarray::parallel::prelude::*;
+use rayon::prelude::*;
 #[cfg(feature = "blas")]
 use ndarray_linalg::{eigh::Eigh, solveh::UPLO, svd::SVD};
 use ndarray_rand::{rand::SeedableRng, rand_distr::Uniform, RandomExt};
-use ndarray_stats::QuantileExt;
 use rand_xoshiro::Xoshiro256Plus;
 #[cfg(feature = "serde")]
 use serde_crate::{Deserialize, Serialize};
@@ -110,35 +111,59 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
 }
 
 impl<F: Float> FastIcaValidParams<F> {
-    // Parallel FastICA, Optimization step
-    fn ica_parallel(&self, x: &Array2<F>, w: &Array2<F>) -> Result<Array2<F>> {
-        let mut w = Self::sym_decorrelation(w)?;
+    fn ica_parallel(&self, x: &Array2<F>, w_init: &Array2<F>) -> Result<Array2<F>> {
+        let mut w = Self::sym_decorrelation(w_init)?;
 
-        let p = x.ncols() as f64;
+        let p = F::cast(x.ncols() as f64);
+        let tol = F::cast(self.tol());
+        let max_iter = self.max_iter();
 
-        for _ in 0..self.max_iter() {
-            let (gwtx, g_wtx) = self.gfunc().exec(&w.dot(x))?;
+        for _ in 0..max_iter {
+            let wtx = w.dot(x);
 
-            let lhs = gwtx.dot(&x.t()).mapv(|x| x / F::cast(p));
-            let rhs = &w * &g_wtx.insert_axis(Axis(1));
-            let wnew = Self::sym_decorrelation(&(lhs - rhs))?;
+            let (gwtx, g_wtx) = self.gfunc().exec(&wtx)?;
 
-            // `lim` let us check for convergence between the old and
-            // new weight values, we want their dot-product to almost equal one
-            let lim = *wnew
-                .outer_iter()
-                .zip(w.outer_iter())
-                .map(|(a, b)| a.dot(&b))
-                .collect::<Array1<F>>()
-                .mapv(|x| x.abs())
-                .mapv(|x| x - F::cast(1.))
-                .mapv(|x| x.abs())
-                .max()
-                .unwrap();
+            let mut lhs = gwtx.dot(&x.t());
+            lhs.par_mapv_inplace(|v| v / p);
+
+            let rhs = {
+                let mut out = w.clone();
+                let g_wtx_vec: Vec<F> = g_wtx.iter().cloned().collect();
+                out.axis_iter_mut(Axis(0))
+                    .into_par_iter()
+                    .zip(g_wtx_vec.into_par_iter())
+                    .for_each(|(mut row, gi)| {
+                        for v in row.iter_mut() {
+                            *v *= gi;
+                        }
+                    });
+                out
+            };
+
+            let mut delta = lhs;
+            delta
+                .iter_mut()
+                .zip(rhs.iter())
+                .par_bridge()
+                .for_each(|(d, r)| {
+                    *d -= *r;
+                });
+
+            let wnew = Self::sym_decorrelation(&delta)?;
+
+            let lim = wnew
+                .axis_iter(Axis(0))
+                .into_par_iter()
+                .zip(w.axis_iter(Axis(0)).into_par_iter())
+                .map(|(wn_row, w_row)| {
+                    let dot = wn_row.dot(&w_row);
+                    (dot.abs() - F::cast(1.)).abs()
+                })
+                .reduce(|| F::cast(0.), |a, b| if a > b { a.max(b) } else { b });
 
             w = wnew;
 
-            if lim < F::cast(self.tol()) {
+            if lim < tol {
                 break;
             }
         }
@@ -146,27 +171,38 @@ impl<F: Float> FastIcaValidParams<F> {
         Ok(w)
     }
 
-    // Symmetric decorrelation
-    //
-    // W <- (W * W.T)^{-1/2} * W
     fn sym_decorrelation(w: &Array2<F>) -> Result<Array2<F>> {
-        #[cfg(feature = "blas")]
-        let (eig_val, eig_vec) = w.dot(&w.t()).with_lapack().eigh(UPLO::Upper)?;
-        #[cfg(not(feature = "blas"))]
-        let (eig_val, eig_vec) = w.dot(&w.t()).with_lapack().eigh()?;
-        let eig_val = eig_val.mapv(F::cast);
-        let eig_vec = eig_vec.without_lapack();
+        let s = w.dot(&w.t()).with_lapack();
 
-        let tmp = &eig_vec
-            * &(eig_val.mapv(|x| x.sqrt()).mapv(|x| {
-                // We lower bound the float value at 1e-7 when taking the reciprocal
-                let lower_bound = F::cast(1e-7);
-                if x < lower_bound {
-                    return lower_bound.recip();
+        #[cfg(feature = "blas")]
+        let (eig_val_raw, eig_vec_raw) = s.eigh(UPLO::Upper)?;
+        #[cfg(not(feature = "blas"))]
+        let (eig_val_raw, eig_vec_raw) = s.eigh()?;
+
+        let eig_val = eig_val_raw.mapv(F::cast);
+        let eig_vec = eig_vec_raw.without_lapack();
+
+        let inv_sqrt = {
+            let mut out = eig_val.clone();
+            out.par_mapv_inplace(|lambda| {
+                let mut s = lambda.sqrt();
+                let lower = F::cast(1e-7);
+                if s < lower {
+                    s = lower;
                 }
-                x.recip()
-            }))
-            .insert_axis(Axis(0));
+                s.recip()
+            });
+            out
+        };
+
+        let mut tmp = eig_vec.clone();
+        tmp.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .for_each(|mut row| {
+                for (v, scale) in row.iter_mut().zip(inv_sqrt.iter()) {
+                    *v *= *scale;
+                }
+            });
 
         Ok(tmp.dot(&eig_vec.t()).dot(w))
     }
@@ -238,38 +274,108 @@ impl GFunc {
     }
 
     fn cube<A: Float>(x: &Array2<A>) -> (Array2<A>, Array1<A>) {
-        (
-            x.mapv(|x| x.powi(3)),
-            x.mapv(|x| A::cast(3.) * x.powi(2))
-                .mean_axis(Axis(1))
-                .unwrap(),
-        )
+        let gwtx = {
+            let mut out = x.clone();
+            out.par_mapv_inplace(|v| v.powi(3));
+            out
+        };
+
+        let g_wtx = {
+            let nrows = x.nrows();
+            let mut out = Array1::<A>::zeros(nrows);
+            out.iter_mut()
+                .enumerate()
+                .par_bridge()
+                .for_each(|(i, o)| {
+                    let row = x.row(i);
+                    let mut acc = A::cast(0.);
+                    let len = A::cast(row.len() as f64);
+                    for v in row.iter() {
+                        let v2 = *v * *v;
+                        acc += A::cast(3.) * v2;
+                    }
+                    *o = acc / len;
+                });
+            out
+        };
+
+        (gwtx, g_wtx)
     }
 
     fn exp<A: Float>(x: &Array2<A>) -> (Array2<A>, Array1<A>) {
-        let exp = x.mapv(|x| -x.powi(2) / A::cast(2.));
-        (
-            x * &exp,
-            (x.mapv(|x| A::cast(1.) - x.powi(2)) * &exp)
-                .mean_axis(Axis(1))
-                .unwrap(),
-        )
+        let mut exp_term = x.clone();
+        exp_term.par_mapv_inplace(|v| {
+            let half = A::cast(0.5);
+            (-(v * v) * half).exp()
+        });
+
+        let mut gwtx = x.clone();
+        gwtx
+            .iter_mut()
+            .zip(exp_term.iter())
+            .par_bridge()
+            .for_each(|(g, e)| {
+                *g *= *e;
+            });
+
+        let g_wtx = {
+            let mut out = Array1::<A>::zeros(x.nrows());
+            out.iter_mut()
+                .enumerate()
+                .par_bridge()
+                .for_each(|(i, o)| {
+                    let row_x = x.row(i);
+                    let row_e = exp_term.row(i);
+                    let mut acc = A::cast(0.);
+                    let len = A::cast(row_x.len() as f64);
+                    for (vx, ve) in row_x.iter().zip(row_e.iter()) {
+                        let one = A::cast(1.);
+                        let term = (one - (*vx * *vx)) * *ve;
+                        acc += term;
+                    }
+                    *o = acc / len;
+                });
+            out
+        };
+
+        (gwtx, g_wtx)
     }
 
-    //#[allow(clippy::manual_range_contains)]
     fn logcosh<A: Float>(x: &Array2<A>, alpha: f64) -> Result<(Array2<A>, Array1<A>)> {
-        //if alpha < 1.0 || alpha > 2.0 {
         if !(1.0..=2.0).contains(&alpha) {
             return Err(FastIcaError::InvalidValue(format!(
                 "alpha must be between 1 and 2 inclusive, got {alpha}"
             )));
         }
-        let alpha = A::cast(alpha);
+        let alpha_a = A::cast(alpha);
 
-        let gx = x.mapv(|x| (x * alpha).tanh());
-        let g_x = gx.mapv(|x| alpha * (A::cast(1.) - x.powi(2)));
+        let mut gx = x.clone();
+        gx.par_mapv_inplace(|v| (v * alpha_a).tanh());
 
-        Ok((gx, g_x.mean_axis(Axis(1)).unwrap()))
+        let mut g_x = gx.clone();
+        g_x.par_mapv_inplace(|v| {
+            let one = A::cast(1.);
+            alpha_a * (one - (v * v))
+        });
+
+        let g_wtx = {
+            let mut out = Array1::<A>::zeros(g_x.nrows());
+            out.iter_mut()
+                .enumerate()
+                .par_bridge()
+                .for_each(|(i, o)| {
+                    let row = g_x.row(i);
+                    let mut acc = A::cast(0.);
+                    let len = A::cast(row.len() as f64);
+                    for v in row.iter() {
+                        acc += *v;
+                    }
+                    *o = acc / len;
+                });
+            out
+        };
+
+        Ok((gx, g_wtx))
     }
 }
 
