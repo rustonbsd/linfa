@@ -105,7 +105,6 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
         Ok(FastIca {
             mean: xmean,
             components,
-            demixing: w,
         })
     }
 }
@@ -183,20 +182,11 @@ impl<F: Float> FastIcaValidParams<F> {
 pub struct FastIca<F> {
     mean: Array1<F>,
     components: Array2<F>,
-    demixing: Array2<F>,
 }
 
 impl<F: Float> FastIca<F> {
     pub fn components(&self) -> &Array2<F> {
         &self.components
-    }
-
-    pub fn demixing(&self) -> &Array2<F> {
-        &self.demixing
-    }
-
-    pub fn mean(&self) -> &Array1<F> {
-        &self.mean
     }
 }
 
