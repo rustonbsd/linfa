@@ -188,6 +188,10 @@ impl<F: Float> FastIca<F> {
     pub fn components(&self) -> &Array2<F> {
         &self.components
     }
+
+    pub fn mean(&self) -> &Array1<F> {
+        &self.mean
+    }
 }
 
 impl<F: Float> PredictInplace<Array2<F>, Array2<F>> for FastIca<F> {
