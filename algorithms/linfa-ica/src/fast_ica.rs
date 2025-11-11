@@ -100,13 +100,12 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
         println!("[FastICA] Computing SVD for whitening... (matrix size: {}x{})", xcentered.nrows(), xcentered.ncols());
         
         // Use randomized SVD for large matrices (> 10000 elements or if ncomponents << min(dims))
-        let use_randomized = xcentered.len() > 100_000_000 || 
-                             (ncomponents < nsamples.min(nfeatures) / 4);
+        let use_randomized = true;//xcentered.len() > 100_000_000 || (ncomponents < nsamples.min(nfeatures) / 4);
         
         let k = if use_randomized {
             println!("[FastICA] Using randomized SVD for large-scale whitening");
-            let n_oversamples = 10.min(nsamples.min(nfeatures) - ncomponents);
-            let n_iter = 5; // Number of power iterations
+            let n_oversamples = (ncomponents/2).min(nsamples.min(nfeatures) - ncomponents);
+            let n_iter = 15; // Number of power iterations
             let seed = self.random_state().map(|s| s as u64);
             let (u, s) = Self::randomized_svd(&xcentered.view().to_owned(), ncomponents, n_oversamples, n_iter, seed)?;
             (u / &s.insert_axis(Axis(0))).t().to_owned()
