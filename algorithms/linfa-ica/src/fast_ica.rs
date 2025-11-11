@@ -186,6 +186,20 @@ pub struct FastIca<F> {
     demixing: Array2<F>,
 }
 
+impl<F: Float> FastIca<F> {
+    pub fn components(&self) -> &Array2<F> {
+        &self.components
+    }
+
+    pub fn demixing(&self) -> &Array2<F> {
+        &self.demixing
+    }
+
+    pub fn mean(&self) -> &Array1<F> {
+        &self.mean
+    }
+}
+
 impl<F: Float> PredictInplace<Array2<F>, Array2<F>> for FastIca<F> {
     /// Recover the sources
     fn predict_inplace(&self, x: &Array2<F>, y: &mut Array2<F>) {
