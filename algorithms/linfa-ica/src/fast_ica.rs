@@ -6,12 +6,12 @@ use linfa::{
     Float,
 };
 #[cfg(not(feature = "blas"))]
-use linfa_linalg::{eigh::*, svd::*};
+use linfa_linalg::eigh::*;
 use ndarray::{Array, Array1, Array2, ArrayBase, Axis, Data, Ix2};
 use ndarray::parallel::prelude::*;
 use rayon::prelude::*;
 #[cfg(feature = "blas")]
-use ndarray_linalg::{eigh::Eigh, solveh::UPLO, svd::SVD};
+use ndarray_linalg::{eigh::Eigh, solveh::UPLO};
 use ndarray_rand::{rand::SeedableRng, rand_distr::Uniform, RandomExt};
 use rand_xoshiro::Xoshiro256Plus;
 #[cfg(feature = "serde")]
@@ -69,25 +69,51 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
 
         // We whiten the matrix to remove any potential correlation between
         // the components
-        println!("[FastICA] Computing SVD for whitening...");
-        let xcentered = xcentered.with_lapack();
-        let k = match xcentered.svd(true, false)? {
-            (Some(u), s, _) => {
-                let s = s.mapv(F::Lapack::cast);
-                // This slice operation will extract the "thin" SVD component of `u` regardless of
-                // whether `.svd` returns a full or thin SVD, because the slice dimensions
-                // correspond to the thin SVD dimensions.
-                (u.slice_move(s![.., ..nsamples.min(nfeatures)]) / s)
-                    .t()
-                    .slice(s![..ncomponents, ..])
-                    .to_owned()
-            }
-            _ => return Err(FastIcaError::SvdDecomposition),
-        };
+        // Using covariance-based whitening instead of SVD for better performance
+        println!("[FastICA] Computing covariance for whitening...");
+        let ncols = xcentered.ncols();
+        let xcentered_lapack = xcentered.view().with_lapack();
+        
+        // Compute covariance matrix: C = X * X^T / n
+        let n = F::Lapack::cast(F::cast(ncols as f64));
+        let cov = xcentered_lapack.dot(&xcentered_lapack.t()).mapv(|v| v / n);
+        
+        println!("[FastICA] Computing eigendecomposition...");
+        // Eigendecomposition of covariance matrix
+        #[cfg(feature = "blas")]
+        let (eig_vals_raw, eig_vecs_raw) = cov.eigh(UPLO::Upper)?;
+        #[cfg(not(feature = "blas"))]
+        let (eig_vals_raw, eig_vecs_raw) = cov.eigh()?;
+        
+        let eig_vals = eig_vals_raw.mapv(F::cast);
+        let eig_vecs = eig_vecs_raw.mapv(F::cast);
+        
+        // Sort eigenvalues and eigenvectors in descending order
+        let mut indices: Vec<usize> = (0..eig_vals.len()).collect();
+        indices.sort_by(|&i, &j| eig_vals[j].partial_cmp(&eig_vals[i]).unwrap());
+        
+        let eig_vals_sorted: Array1<F> = indices.iter().map(|&i| eig_vals[i]).collect();
+        let mut eig_vecs_sorted = Array2::zeros((eig_vecs.nrows(), ncomponents));
+        for (j, &i) in indices.iter().take(ncomponents).enumerate() {
+            eig_vecs_sorted.column_mut(j).assign(&eig_vecs.column(i));
+        }
+        
+        // Compute whitening matrix: K = D^(-1/2) * E^T where D has eigenvalues, E has eigenvectors
+        println!("[FastICA] Building whitening matrix...");
+        let mut k = Array2::zeros((ncomponents, xcentered.nrows()));
+        k.axis_iter_mut(Axis(0))
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(i, mut row)| {
+                let scale = (eig_vals_sorted[i].sqrt()).recip();
+                let eigvec = eig_vecs_sorted.column(i);
+                for (r, &e) in row.iter_mut().zip(eigvec.iter()) {
+                    *r = e * scale;
+                }
+            });
 
         println!("[FastICA] Whitening data...");
-        let mut xwhitened = k.dot(&xcentered).without_lapack();
-        let k = k.without_lapack();
+        let mut xwhitened = k.dot(&xcentered);
 
         // We multiply the matrix with root of the number of records
         let nsamples_sqrt = F::cast(nsamples).sqrt();
