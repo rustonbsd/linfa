@@ -23,25 +23,25 @@ use crate::hyperparams::FastIcaValidParams;
 // Simple QR decomposition using Gram-Schmidt
 fn qr_decomposition<F: Float>(a: &Array2<F>) -> Result<(Array2<F>, Array2<F>)> {
     let (m, n) = (a.nrows(), a.ncols());
-    let mut q = Array2::<F>::zeros((m, n));
+    let mut q = a.clone();
     let mut r = Array2::<F>::zeros((n, n));
     
     for j in 0..n {
-        let mut v = a.column(j).to_owned();
-        
-        // Orthogonalize against previous columns
-        for i in 0..j {
-            let q_i = q.column(i);
-            let r_ij = v.dot(&q_i);
-            r[[i, j]] = r_ij;
-            v.scaled_add(-r_ij, &q_i);
+        // Reorthogonalization pass (twice for stability)
+        for _ in 0..2 {
+            for i in 0..j {
+                let r_ij = q.column(j).dot(&q.column(i));
+                r[[i, j]] = r[[i, j]] + r_ij;
+                let q_i = q.column(i).to_owned();
+                q.column_mut(j).scaled_add(-r_ij, &q_i);
+            }
         }
         
-        // Normalize
-        let norm = v.iter().map(|&x| x * x).fold(F::zero(), |acc, x| acc + x).sqrt();
+        let norm = q.column(j).dot(&q.column(j)).sqrt();
+        r[[j, j]] = norm;
+        
         if norm > F::cast(1e-10) {
-            r[[j, j]] = norm;
-            q.column_mut(j).assign(&v.mapv(|x| x / norm));
+            q.column_mut(j).mapv_inplace(|x| x / norm);
         }
     }
     
@@ -105,8 +105,8 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
         
         let k = if use_randomized {
             println!("[FastICA] Using randomized SVD for large-scale whitening");
-            let n_oversamples = 10.min(nsamples.min(nfeatures) - ncomponents);
-            let n_iter = 5; // Number of power iterations
+            let n_oversamples = 20.min(nsamples.min(nfeatures) - ncomponents);
+            let n_iter = 10; // Number of power iterations
             let seed = self.random_state().map(|s| s as u64);
             let (u, s) = Self::randomized_svd(&xcentered.view().to_owned(), ncomponents, n_oversamples, n_iter, seed)?;
             (u / &s.insert_axis(Axis(0))).t().to_owned()
