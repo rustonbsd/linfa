@@ -20,7 +20,7 @@ categories = ["algorithms", "mathematics", "science"]
 exclude = [".github/"]
 
 [features]
-default = []
+default = ["blas"]
 benchmarks = ["criterion", "pprof"]
 netlib-static = ["blas", "ndarray-linalg/netlib-static"]
 netlib-system = ["blas", "ndarray-linalg/netlib-system"]

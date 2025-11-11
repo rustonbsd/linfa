@@ -5,15 +5,17 @@ use linfa::{
     traits::*,
     Float,
 };
-#[cfg(not(feature = "blas"))]
-use linfa_linalg::{eigh::*, svd::*};
-use ndarray::{Array, Array1, Array2, ArrayBase, Axis, Data, Ix2};
 use ndarray::parallel::prelude::*;
-use rayon::prelude::*;
-#[cfg(feature = "blas")]
+use ndarray::{Array, Array1, Array2, ArrayBase, Axis, Data, Ix2};
 use ndarray_linalg::{eigh::Eigh, solveh::UPLO, svd::SVD};
-use ndarray_rand::{rand::SeedableRng, rand_distr::Uniform, RandomExt};
+use ndarray_rand::{
+    rand::SeedableRng,
+    rand_distr::{StandardNormal, Uniform},
+    RandomExt,
+};
+use num_traits::ToPrimitive as _;
 use rand_xoshiro::Xoshiro256Plus;
+use rayon::prelude::*;
 #[cfg(feature = "serde")]
 use serde_crate::{Deserialize, Serialize};
 
@@ -25,10 +27,10 @@ fn qr_decomposition<F: Float>(a: &Array2<F>) -> Result<(Array2<F>, Array2<F>)> {
     let (m, n) = (a.nrows(), a.ncols());
     let mut q = Array2::<F>::zeros((m, n));
     let mut r = Array2::<F>::zeros((n, n));
-    
+
     for j in 0..n {
         let mut v = a.column(j).to_owned();
-        
+
         // Orthogonalize against previous columns
         for i in 0..j {
             let q_i = q.column(i);
@@ -36,19 +38,24 @@ fn qr_decomposition<F: Float>(a: &Array2<F>) -> Result<(Array2<F>, Array2<F>)> {
             r[[i, j]] = r_ij;
             v.scaled_add(-r_ij, &q_i);
         }
-        
+
         // Normalize
-        let norm = v.iter().map(|&x| x * x).fold(F::zero(), |acc, x| acc + x).sqrt();
+        let norm = v
+            .iter()
+            .map(|&x| x * x)
+            .fold(F::zero(), |acc, x| acc + x)
+            .sqrt();
         if norm > F::cast(1e-10) {
             r[[j, j]] = norm;
             q.column_mut(j).assign(&v.mapv(|x| x / norm));
         }
     }
-    
+
     Ok((q, r))
 }
 
-impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
+#[cfg(feature = "blas")]
+impl<F: Float + ndarray_linalg::Lapack, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
     for FastIcaValidParams<F>
 {
     type Object = FastIca<F>;
@@ -83,7 +90,10 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
             )));
         }
 
-        println!("[FastICA] Starting fit: {} samples, {} features, {} components", nsamples, nfeatures, ncomponents);
+        println!(
+            "[FastICA] Starting fit: {} samples, {} features, {} components",
+            nsamples, nfeatures, ncomponents
+        );
 
         // We center the input by subtracting the mean of its features
         // safe unwrap because we already returned an error on zero samples
@@ -97,17 +107,27 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
 
         // We whiten the matrix to remove any potential correlation between
         // the components
-        println!("[FastICA] Computing SVD for whitening... (matrix size: {}x{})", xcentered.nrows(), xcentered.ncols());
-        
+        println!(
+            "[FastICA] Computing SVD for whitening... (matrix size: {}x{})",
+            xcentered.nrows(),
+            xcentered.ncols()
+        );
+
         // Use randomized SVD for large matrices (> 10000 elements or if ncomponents << min(dims))
-        let use_randomized = false;//xcentered.len() > 100_000_000 || (ncomponents < nsamples.min(nfeatures) / 4);
-        
+        let use_randomized = false; //xcentered.len() > 100_000_000 || (ncomponents < nsamples.min(nfeatures) / 4);
+
         let k = if use_randomized {
             println!("[FastICA] Using randomized SVD for large-scale whitening");
-            let n_oversamples = (ncomponents/2).min(nsamples.min(nfeatures) - ncomponents);
+            let n_oversamples = (ncomponents / 2).min(nsamples.min(nfeatures) - ncomponents);
             let n_iter = 15; // Number of power iterations
             let seed = self.random_state().map(|s| s as u64);
-            let (u, s) = Self::randomized_svd(&xcentered.view().to_owned(), ncomponents, n_oversamples, n_iter, seed)?;
+            let (u, s) = Self::randomized_svd(
+                &xcentered.view().to_owned(),
+                ncomponents,
+                n_oversamples,
+                n_iter,
+                seed,
+            )?;
             (u / &s.insert_axis(Axis(0))).t().to_owned()
         } else {
             println!("[FastICA] Using standard SVD");
@@ -129,7 +149,7 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
         let mut xwhitened = k.dot(&xcentered);
 
         // We multiply the matrix with root of the number of records
-        let nsamples_sqrt = F::cast(nsamples).sqrt();
+        let nsamples_sqrt = num_traits::Float::sqrt(F::cast(nsamples));
         xwhitened.mapv_inplace(|x| x * nsamples_sqrt);
 
         // We initialize the de-mixing matrix with a uniform distribution
@@ -159,70 +179,115 @@ impl<F: Float, D: Data<Elem = F>, T> Fit<ArrayBase<D, Ix2>, T, FastIcaError>
     }
 }
 
-impl<F: Float> FastIcaValidParams<F> {
+#[cfg(feature = "blas")]
+impl<F: Float + ndarray_linalg::Lapack> FastIcaValidParams<F> {
     // Randomized SVD for large-scale whitening
     // Based on Halko, Martinsson, and Tropp (2011)
     fn randomized_svd(
-        x: &Array2<F>,
+        x: &Array2<F>, // shape: D x N (features x samples)
         n_components: usize,
         n_oversamples: usize,
         n_iter: usize,
         random_state: Option<u64>,
     ) -> Result<(Array2<F>, Array1<F>)> {
-        let (n_features, n_samples) = (x.nrows(), x.ncols());
-        let n_random = n_components + n_oversamples;
-        
-        println!("[RandomizedSVD] Generating random matrix {}x{}", n_samples, n_random);
-        // Generate random Gaussian matrix
-        let q: Array2<F> = if let Some(seed) = random_state {
+        let (d, n) = (x.nrows(), x.ncols());
+        let mut r = n_components + n_oversamples.max(32);
+        r = r.min(d).min(n);
+
+        println!(
+            "[RandomizedSVD] D={} N={} r={} (k={} + p={}), iters={}",
+            d,
+            n,
+            r,
+            n_components,
+            r.saturating_sub(n_components),
+            n_iter
+        );
+
+        // Omega: N x r
+        let omega: Array2<F> = if let Some(seed) = random_state {
             let mut rng = Xoshiro256Plus::seed_from_u64(seed);
-            Array::random_using((n_samples, n_random), ndarray_rand::rand_distr::StandardNormal, &mut rng)
-                .mapv(|x: f64| F::cast(x))
+            Array::random_using((n, r), StandardNormal, &mut rng).mapv(|z: f64| F::cast(z))
         } else {
-            Array::random((n_samples, n_random), ndarray_rand::rand_distr::StandardNormal)
-                .mapv(|x: f64| F::cast(x))
+            Array::random((n, r), StandardNormal).mapv(|z: f64| F::cast(z))
         };
-        
-        println!("[RandomizedSVD] Computing range approximation with {} power iterations", n_iter);
-        // Power iteration to improve approximation: Y = (XX^T)^n_iter * X * Q
-        let mut y = x.dot(&q);
+
+        // Y = X * Omega (D x r), with power iterations and re-orth via thin SVD
+        let mut y = x.dot(&omega);
         for i in 0..n_iter {
-            println!("[RandomizedSVD] Power iteration {}/{}", i + 1, n_iter);
-            y = x.dot(&x.t().dot(&y));
+            println!("[RandomizedSVD] power iter {}/{}", i + 1, n_iter);
+            // Z = X^T * Y (N x r) then Y = X * Z (D x r)
+            let z = x.t().dot(&y);
+            y = x.dot(&z);
+
+            // Re-orthonormalize Y -> Q via thin SVD for stability
+            let (u_opt, _s_opt, _vt_opt) = y.with_lapack().svd(true, false)?;
+            y = u_opt
+                .ok_or(FastIcaError::SvdDecomposition)?
+                .without_lapack();
         }
-        
-        println!("[RandomizedSVD] QR decomposition");
-        // QR decomposition to orthonormalize
-        let (q_orth, _) = qr_decomposition(&y)?;
-        
-        println!("[RandomizedSVD] Computing small SVD");
-        // Project X onto the range: B = Q^T * X
-        let b = q_orth.t().dot(x);
-        
-        // SVD of small matrix B
-        let b_lapack = b.with_lapack();
-        let (u_tilde, s_raw, _vt) = match b_lapack.svd(true, false)? {
-            (Some(u), s, vt) => (u, s, vt),
-            _ => return Err(FastIcaError::SvdDecomposition),
+
+        // Final Q from thin SVD of Y (stable)
+        let (u_opt, _s_opt, _vt_opt) = y.with_lapack().svd(true, false)?;
+        let q = u_opt
+            .ok_or(FastIcaError::SvdDecomposition)?
+            .slice_move(s![.., ..r])
+            .without_lapack(); // D x r
+
+        // Stream over X by column blocks to build M = (Q^T X)(Q^T X)^T (r x r)
+        let mut m = Array2::<F>::zeros((r, r));
+        let block = 4096usize.max(2 * r).min(n); // tuneable; keeps cache/mem happy
+
+        println!("[RandomizedSVD] accumulating M with block={}", block);
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + block).min(n);
+            let x_blk = x.slice(s![.., start..end]); // D x b
+            let z = q.t().dot(&x_blk); // r x b
+                                       // M += Z Z^T
+            m = m + z.dot(&z.t());
+            start = end;
+        }
+
+        // Eigendecompose M = V diag(s^2) V^T
+        let (eig_vals_raw, v_raw) = {
+            #[cfg(feature = "blas")]
+            {
+                use ndarray_linalg::eigh::Eigh;
+                m.with_lapack().eigh(UPLO::Upper)?
+            }
+            #[cfg(not(feature = "blas"))]
+            {
+                m.eigh()?
+            }
         };
-        
-        let s = s_raw.mapv(F::Lapack::cast);
-        let u_tilde = u_tilde.without_lapack();
-        
-        // U = Q * U_tilde
-        println!("[RandomizedSVD] Reconstructing left singular vectors");
-        let u = q_orth.dot(&u_tilde).mapv(F::cast);
-        let s = s.mapv(F::cast);
-        
-        // Extract top n_components
-        let u_k = u.slice(s![.., ..n_components]).to_owned();
-        let s_k = s.slice(s![..n_components]).to_owned();
-        
-        Ok((u_k, s_k))
+        let mut s = eig_vals_raw.mapv(|lam| {
+            let z = F::cast(lam.to_f64().unwrap().max(0.0));
+            num_traits::Float::sqrt(z)
+        });
+        let v = v_raw.without_lapack(); // r x r
+
+        // Sort by descending singular value
+        let mut idx: Vec<usize> = (0..r).collect();
+        idx.sort_by(|&i, &j| s[[j]].partial_cmp(&s[[i]]).unwrap());
+        let take = n_components.min(r);
+
+        let mut u = Array2::<F>::zeros((d, take));
+        let mut s_k = Array1::<F>::zeros(take);
+        for (t, &i) in idx.iter().take(take).enumerate() {
+            let v_i = v.column(i).to_owned(); // r
+            u.column_mut(t).assign(&q.dot(&v_i)); // D
+            s_k[t] = s[i];
+        }
+
+        Ok((u, s_k))
     }
 
     fn ica_parallel(&self, x: &Array2<F>, w_init: &Array2<F>) -> Result<Array2<F>> {
-        println!("[ICA] Starting parallel optimization (max_iter: {})", self.max_iter());
+        println!(
+            "[ICA] Starting parallel optimization (max_iter: {})",
+            self.max_iter()
+        );
         let mut w = Self::sym_decorrelation(w_init)?;
 
         let p = F::cast(x.ncols() as f64);
@@ -268,14 +333,19 @@ impl<F: Float> FastIcaValidParams<F> {
                 .zip(w.axis_iter(Axis(0)).into_par_iter())
                 .map(|(wn_row, w_row)| {
                     let dot = wn_row.dot(&w_row);
-                    (dot.abs() - F::cast(1.)).abs()
+                    num_traits::Float::abs(num_traits::Float::abs(dot) - F::cast(1.))
                 })
                 .reduce(|| F::cast(0.), |a, b| if a > b { a.max(b) } else { b });
 
             w = wnew;
 
             if lim < tol {
-                println!("[ICA] Converged at iteration {} (lim: {:e} < tol: {:e})", iter + 1, lim, tol);
+                println!(
+                    "[ICA] Converged at iteration {} (lim: {:e} < tol: {:e})",
+                    iter + 1,
+                    lim,
+                    tol
+                );
                 break;
             }
         }
@@ -299,7 +369,7 @@ impl<F: Float> FastIcaValidParams<F> {
         let inv_sqrt = {
             let mut out = eig_val.clone();
             out.par_mapv_inplace(|lambda| {
-                let mut s = lambda.sqrt();
+                let mut s = num_traits::Float::sqrt(lambda);
                 let lower = F::cast(1e-7);
                 if s < lower {
                     s = lower;
@@ -398,19 +468,16 @@ impl GFunc {
         let g_wtx = {
             let nrows = x.nrows();
             let mut out = Array1::<A>::zeros(nrows);
-            out.iter_mut()
-                .enumerate()
-                .par_bridge()
-                .for_each(|(i, o)| {
-                    let row = x.row(i);
-                    let mut acc = A::cast(0.);
-                    let len = A::cast(row.len() as f64);
-                    for v in row.iter() {
-                        let v2 = *v * *v;
-                        acc += A::cast(3.) * v2;
-                    }
-                    *o = acc / len;
-                });
+            out.iter_mut().enumerate().par_bridge().for_each(|(i, o)| {
+                let row = x.row(i);
+                let mut acc = A::cast(0.);
+                let len = A::cast(row.len() as f64);
+                for v in row.iter() {
+                    let v2 = *v * *v;
+                    acc += A::cast(3.) * v2;
+                }
+                *o = acc / len;
+            });
             out
         };
 
@@ -425,8 +492,7 @@ impl GFunc {
         });
 
         let mut gwtx = x.clone();
-        gwtx
-            .iter_mut()
+        gwtx.iter_mut()
             .zip(exp_term.iter())
             .par_bridge()
             .for_each(|(g, e)| {
@@ -435,21 +501,18 @@ impl GFunc {
 
         let g_wtx = {
             let mut out = Array1::<A>::zeros(x.nrows());
-            out.iter_mut()
-                .enumerate()
-                .par_bridge()
-                .for_each(|(i, o)| {
-                    let row_x = x.row(i);
-                    let row_e = exp_term.row(i);
-                    let mut acc = A::cast(0.);
-                    let len = A::cast(row_x.len() as f64);
-                    for (vx, ve) in row_x.iter().zip(row_e.iter()) {
-                        let one = A::cast(1.);
-                        let term = (one - (*vx * *vx)) * *ve;
-                        acc += term;
-                    }
-                    *o = acc / len;
-                });
+            out.iter_mut().enumerate().par_bridge().for_each(|(i, o)| {
+                let row_x = x.row(i);
+                let row_e = exp_term.row(i);
+                let mut acc = A::cast(0.);
+                let len = A::cast(row_x.len() as f64);
+                for (vx, ve) in row_x.iter().zip(row_e.iter()) {
+                    let one = A::cast(1.);
+                    let term = (one - (*vx * *vx)) * *ve;
+                    acc += term;
+                }
+                *o = acc / len;
+            });
             out
         };
 
@@ -475,18 +538,15 @@ impl GFunc {
 
         let g_wtx = {
             let mut out = Array1::<A>::zeros(g_x.nrows());
-            out.iter_mut()
-                .enumerate()
-                .par_bridge()
-                .for_each(|(i, o)| {
-                    let row = g_x.row(i);
-                    let mut acc = A::cast(0.);
-                    let len = A::cast(row.len() as f64);
-                    for v in row.iter() {
-                        acc += *v;
-                    }
-                    *o = acc / len;
-                });
+            out.iter_mut().enumerate().par_bridge().for_each(|(i, o)| {
+                let row = g_x.row(i);
+                let mut acc = A::cast(0.);
+                let len = A::cast(row.len() as f64);
+                for v in row.iter() {
+                    acc += *v;
+                }
+                *o = acc / len;
+            });
             out
         };
 

@@ -13,7 +13,7 @@ keywords = ["factorization", "machine-learning", "linfa", "unsupervised"]
 categories = ["algorithms", "mathematics", "science"]
 
 [features]
-default = []
+default = ["blas"]
 blas = ["ndarray-linalg", "linfa/ndarray-linalg"]
 serde = ["serde_crate", "ndarray/serde"]
 
